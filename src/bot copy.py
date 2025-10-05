@@ -5,30 +5,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from telegram import Update, Message, PhotoSize, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, Message, PhotoSize
 from dotenv import load_dotenv
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
-)
-from warnings import filterwarnings
-from telegram.warnings import PTBUserWarning
-
-filterwarnings(
-    "ignore",
-    category=PTBUserWarning,
-    message=r"If 'per_message=False', 'CallbackQueryHandler' will not be tracked"
 )
 
 load_dotenv()
 
 # ----- ESTADOS DA CONVERSA -----
-WAITING_PHOTO, WAITING_NAME, WAITING_VALUE, WAITING_DOC_TYPE = range(4)
+WAITING_PHOTO, WAITING_NAME, WAITING_VALUE = range(3)
 
 DOWNLOAD_DIR = Path("fotos")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -36,19 +27,32 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # --------- HELPERS ---------
 
 def sanitize_filename_component(text: str) -> str:
+    """
+    Remove caracteres problemáticos para nomes de arquivo.
+    Mantém letras, números, espaços, hífens e underscores.
+    Converte múltiplos espaços em underscore.
+    """
     text = text.strip()
+    # troque acentos simples; opcional: normalizar unicode
     text = re.sub(r"[^\w\s\-.,;]", "", text, flags=re.UNICODE)
     text = re.sub(r"\s+", "_", text)
-    return text[:80]
+    return text[:80]  # evita nomes muito longos
 
 def parse_currency(text: str) -> Optional[str]:
+    """
+    Aceita formatos como: 123,45 | 1.234,56 | R$ 123,45 | 123.45
+    Retorna string formatada '123,45' (padrão BR), ou None se inválido.
+    """
     if not text:
         return None
-    t = text.strip().upper().replace("R$", "").replace(" ", "")
+    t = text.strip().upper()
+    t = t.replace("R$", "").replace(" ", "")
+    # se tiver vírgula, assumimos que é decimal br; remover pontos de milhar
     if "," in t and "." in t:
         t = t.replace(".", "").replace(",", ".")
     elif "," in t and "." not in t:
         t = t.replace(",", ".")
+    # agora t deve estar em decimal com ponto
     try:
         value = float(t)
         return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -56,6 +60,7 @@ def parse_currency(text: str) -> Optional[str]:
         return None
 
 def best_photo(photos: list[PhotoSize]) -> PhotoSize:
+    """Escolhe a melhor resolução (a última costuma ser a maior)."""
     return photos[-1]
 
 def timestamp_now() -> str:
@@ -66,7 +71,7 @@ def timestamp_now() -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "Olá! Envie **uma foto** da guia.\n"
-        "Depois vou pedir *nome* e *valor* e você escolhe o tipo (RX ou GTO).",
+        "Depois vou pedir *nome* e *valor* para salvar o arquivo com essas informações.",
         parse_mode="Markdown",
     )
     return WAITING_PHOTO
@@ -82,6 +87,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await msg.reply_text("Ops, preciso de uma *foto*. Tente novamente.", parse_mode="Markdown")
         return WAITING_PHOTO
 
+    # Guarda o file_id da melhor resolução
     ph = best_photo(msg.photo)
     context.user_data["pending_photo_file_id"] = ph.file_id
 
@@ -114,72 +120,40 @@ async def handle_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     context.user_data["value"] = value_fmt
 
-    # Mostra botões de escolha (RX / GTO)
-    keyboard = [
-        [
-            InlineKeyboardButton("📎 Anexar RX", callback_data="RX"),
-            InlineKeyboardButton("📄 Anexar GTO Digitalizada", callback_data="GTO"),
-        ]
-    ]
-    await update.message.reply_text(
-        "Escolha o tipo do documento:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return WAITING_DOC_TYPE
-
-async def handle_doc_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe a escolha do botão (RX/GTO), baixa a foto e salva com o sufixo."""
-    query = update.callback_query
-    await query.answer()
-
-    doc_type = query.data  # "RX" ou "GTO"
-    context.user_data["doc_type"] = doc_type
-
-    # Valida dados necessários
+    # Agora baixamos a foto que ficou pendente
     file_id = context.user_data.get("pending_photo_file_id")
-    name = context.user_data.get("name")
-    value = context.user_data.get("value")
-
-    if not (file_id and name and value):
-        await query.edit_message_text("Faltam dados para salvar. Envie a foto novamente, por favor.")
-        context.user_data.clear()
+    if not file_id:
+        await update.message.reply_text("Não encontrei a foto. Envie a foto novamente, por favor.")
+        # volta para o estado de esperar foto
         return WAITING_PHOTO
 
-    # Baixa e salva com sufixo do tipo
+    # Recupera extensão do arquivo quando baixar
     try:
+        # Baixa arquivo
         tg_file = await context.bot.get_file(file_id)
+        # tenta inferir extensão do caminho remoto
         ext = Path(tg_file.file_path).suffix.lower() if tg_file.file_path else ".jpg"
         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
             ext = ".jpg"
 
-        fname = f"{timestamp_now()} - {name} - R$ {value} - {doc_type}{ext}"
+        fname = f"{timestamp_now()} - {context.user_data['name']} - R$ {context.user_data['value']}{ext}"
         dest = DOWNLOAD_DIR / fname
         await tg_file.download_to_drive(custom_path=str(dest))
 
-        # Atualiza a mensagem dos botões para um texto final
-        await query.edit_message_text(
-            f"✅ Arquivo salvo como:\n`{dest}`",
-            parse_mode="Markdown",
-        )
-
+        await update.message.reply_text(f"✅ Arquivo salvo em: `{dest}`", parse_mode="Markdown")
     except Exception as e:
-        await query.edit_message_text(f"Falhou ao baixar/salvar a foto: {e}")
+        await update.message.reply_text(f"Falhou ao baixar/salvar a foto: {e}")
         return WAITING_PHOTO
 
-    # Limpa itens e volta para esperar outra foto
+    # Limpa somente itens da última operação (deixa a conversa pronta p/ próxima foto)
     context.user_data.pop("pending_photo_file_id", None)
     context.user_data.pop("name", None)
     context.user_data.pop("value", None)
-    context.user_data.pop("doc_type", None)
 
-    # Manda uma mensagem fora do callback preparando para a próxima
-    if query.message and query.message.chat:
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="Se quiser salvar outra guia, é só **enviar outra foto**. Para sair, use /cancel.",
-            parse_mode="Markdown",
-        )
-
+    await update.message.reply_text(
+        "Se quiser salvar outra guia, é só **enviar outra foto**. Para sair, use /cancel.",
+        parse_mode="Markdown",
+    )
     return WAITING_PHOTO
 
 async def handle_text_when_waiting_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -206,13 +180,9 @@ def main():
             WAITING_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_value),
             ],
-            WAITING_DOC_TYPE: [
-                CallbackQueryHandler(handle_doc_type),
-            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
-        per_message=False,
     )
 
     application.add_handler(conv)
@@ -224,4 +194,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except RuntimeError:
+        # Em alguns ambientes, já existe um loop rodando; nesse caso, apenas chama main() sem asyncio.run
         main()

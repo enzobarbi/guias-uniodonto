@@ -6,8 +6,13 @@ name = "pypi"
 [packages]
 python-telegram-bot = "==21.4"
 dotenv = "*"
+selenium = "*"
 
 [dev-packages]
+ipykernel = "*"
 
 [requires]
 python_version = "3.12"
+
+[scripts]
+start = "python src/bot.py"

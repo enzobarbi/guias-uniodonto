@@ -14,8 +14,9 @@ pipenv run start
 após fazer isso o bot está no ar e pronto para ser usado.
 
 ## futuras implementaçoes
-* scrapping para enviar as fotos e os precos para o site da uniodonto.
-* tentar fazer um instalador aumtomatico da versao do python e do pipenv e instalar as dependencias (shell?)
+* refatorar codigo para utilizar funcoes dele mesmo em outros lugares
 * achar uma forma de digitar o nome e o preco na mesma linha. 
 * adicionar um comando /finalizar que remove todas as fotos da pasta fotos
 * mudar o nome da pasta fotos para guias.
+* Fazer um bash que instale o asdf, pipenv e docker, 
+* colocar o bot pra rodar no docker 

@@ -23,9 +23,32 @@ load_dotenv()
 
 # Configurações
 FOTOS_DIR = Path(__file__).parent.parent / "fotos"
-CPF_TALUDE = str(os.getenv("CPF_TALUDE"))
-COD_UNIODONTO = str(os.getenv("COD_UNIODONTO"))
-PASSWORD = str(os.getenv("PASSWORD"))
+
+# Validação de variáveis de ambiente
+def get_env_var(name: str, required: bool = True) -> str:
+    """Obtém variável de ambiente com validação.
+    
+    Args:
+        name: Nome da variável de ambiente
+        required: Se True, lança exceção se variável não existir ou estiver vazia
+        
+    Returns:
+        Valor da variável de ambiente
+        
+    Raises:
+        ValueError: Se variável for obrigatória e não existir ou estiver vazia
+    """
+    value = os.getenv(name)
+    if required and (value is None or value.strip() == ""):
+        raise ValueError(
+            f"Variável de ambiente '{name}' não está definida ou está vazia. "
+            f"Verifique seu arquivo .env"
+        )
+    return value
+
+CPF_TALUDE = get_env_var("CPF_TALUDE")
+COD_UNIODONTO = get_env_var("COD_UNIODONTO")
+PASSWORD = get_env_var("PASSWORD")
 
 
 class UniodontoProcessor:
@@ -39,8 +62,8 @@ class UniodontoProcessor:
         """Configura e inicializa o driver do Selenium."""
         opts = Options()
         # opts.add_argument("--headless=new")  # descomente para rodar sem interface
-        opts.add_argument("--window-size=1366,768")
-        opts.add_experimental_option("detach", True)
+        opts.add_argument("--start-maximized")  # Inicia maximizado
+        opts.add_experimental_option("detach", True)  # Mantém navegador aberto mesmo em caso de erro
         
         self.driver = webdriver.Chrome(options=opts)
         self.wait = WebDriverWait(self.driver, 20)
@@ -160,42 +183,108 @@ class UniodontoProcessor:
         print("✓ Busca realizada")
         
     def parse_filename(self, file_path):
-        """Extrai nome, preço e tipo de anexo do nome do arquivo.
+        """Extrai nome, data e tipo de anexo do nome do arquivo.
         
-        Formato esperado: YYYY-MM-DD_HH-MM-SS - Nome_completo - R$ VALOR - TIPO.jpg
+        Formato esperado: Nome_completo - DD-MM-YYYY - TIPO.jpg
+        Exemplo: Leticia_Jahn - 10-10-2025 - GTO.jpg
         """
         file_name = os.path.basename(file_path)
         parts = file_name.split(" - ")
         
-        if len(parts) < 4:
+        if len(parts) < 3:
             raise ValueError(f"Formato de arquivo inválido: {file_name}")
         
-        data_name = parts[1].replace("_", " ")
-        data_price = parts[2].split(" ")[1]  # Pega o valor após "R$"
-        data_anexo = parts[3].split(".")[0]  # Remove a extensão
+        data_name = parts[0].replace("_", " ")
+        data_date = parts[1]  # DD-MM-YYYY
+        data_anexo = parts[2].split(".")[0]  # Remove a extensão
         
         nome = data_name.title()
-        preco = data_price
+        # Converte data de DD-MM-YYYY para DD/MM/YYYY para busca no site
+        data_site = data_date.replace("-", "/")
         anexo = data_anexo
         
-        return nome, preco, anexo, file_path
+        return nome, data_site, anexo, file_path
         
-    def find_and_click_user(self, nome, preco):
+    def scroll_table_to_load_all(self):
+        """Faz scroll na tabela para carregar todos os elementos."""
+        try:
+            # Encontra o container da tabela ou a própria tabela
+            table = self.driver.find_element(By.ID, "tabelaListagem")
+            
+            # Tenta encontrar o container pai que tem o scrollbar (geralmente um div ou tbody)
+            container = None
+            try:
+                # Primeiro tenta encontrar um container com scrollbar
+                container = table.find_element(By.XPATH, "./ancestor::div[contains(@style, 'overflow')]")
+            except:
+                try:
+                    # Se não encontrar, tenta o tbody
+                    container = table.find_element(By.TAG_NAME, "tbody")
+                except:
+                    # Se não encontrar, usa a própria tabela
+                    container = table
+            
+            # Obtém a altura inicial
+            last_height = self.driver.execute_script("return arguments[0].scrollHeight", container)
+            scroll_attempts = 0
+            max_scroll_attempts = 20  # Limite de tentativas para evitar loop infinito
+            
+            print("  → Carregando toda a tabela (fazendo scroll)...")
+            
+            while scroll_attempts < max_scroll_attempts:
+                # Faz scroll até o final do container
+                self.driver.execute_script(
+                    "arguments[0].scrollTop = arguments[0].scrollHeight;",
+                    container
+                )
+                sleep(0.5)  # Aguarda elementos carregarem
+                
+                # Verifica nova altura
+                new_height = self.driver.execute_script("return arguments[0].scrollHeight", container)
+                
+                # Se a altura não mudou, significa que chegou ao final
+                if new_height == last_height:
+                    break
+                
+                last_height = new_height
+                scroll_attempts += 1
+            
+            # Faz scroll de volta para o topo para facilitar a visualização
+            self.driver.execute_script("arguments[0].scrollTop = 0;", container)
+            sleep(0.5)
+            
+            print(f"  ✓ Tabela totalmente carregada ({scroll_attempts} tentativas de scroll)")
+            return True
+            
+        except Exception as e:
+            print(f"  ⚠ Aviso ao fazer scroll na tabela: {e}")
+            return False
+    
+    def find_and_click_user(self, nome, data):
         """Encontra e clica no usuário correto na tabela."""
-        print(f"\n  → Procurando: {nome} (R$ {preco})")
+        print(f"\n  → Procurando: {nome} ({data})")
         
-        # XPath para encontrar a linha que tem o nome e o preço
+        # Primeiro, faz scroll para carregar toda a tabela
+        self.scroll_table_to_load_all()
+        
+        # XPath para encontrar a linha que tem o nome e a data
+        # No site: coluna 3 (td[3]) tem a data, coluna 4 (td[4]) tem o nome
         row_xpath = (
             f"//table[@id='tabelaListagem']//tr["
             f"  td[4]//a[normalize-space()='{nome}'] and "
-            f"  .//td[normalize-space()='{preco}']"
+            f"  td[3][normalize-space()='{data}']"
             f"]"
         )
         
+
         try:
+            # Tenta encontrar o elemento
             row = self.driver.find_element(By.XPATH, row_xpath)
             link = row.find_element(By.XPATH, "td[4]//a")
+            
+            # Faz scroll até o elemento para garantir que está visível
             self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
+            sleep(0.5)
             
             try:
                 self.wait.until(EC.element_to_be_clickable(link)).click()
@@ -249,10 +338,22 @@ class UniodontoProcessor:
         
         # Extrai código de controle da URL
         url_atual = self.driver.current_url
+        if "controle=" not in url_atual:
+            print(f"  ✗ Erro: URL não contém parâmetro 'controle'")
+            return False
+        
         codigo = url_atual.split("controle=")[1].split("&")[0]
         
         # Obtém cookies do Selenium
-        phpsessid = self.driver.get_cookie('PHPSESSID')['value']
+        try:
+            cookie = self.driver.get_cookie('PHPSESSID')
+            if not cookie or 'value' not in cookie:
+                print(f"  ✗ Erro: Cookie PHPSESSID não encontrado")
+                return False
+            phpsessid = cookie['value']
+        except Exception as e:
+            print(f"  ✗ Erro ao obter cookie: {e}")
+            return False
         
         # Configura upload via requests
         url_upload = "https://www.sisoweb.coop.br/web/cooperados/upload.process.imagens.php"
@@ -327,49 +428,6 @@ class UniodontoProcessor:
         self.driver.get("https://www.sisoweb.coop.br/web/cooperados/gerar.lote.php#")
         sleep(2)
         print("  ✓ Retornou para página de busca")
-    
-    def verify_upload_success(self, nome, preco):
-        """Verifica se o upload foi bem-sucedido checando se existe checkbox ao invés de imagem.
-        
-        Retorna True se encontrar checkbox (upload bem-sucedido)
-        Retorna False se encontrar imagem (upload não realizado ou falhou)
-        """
-        print("  → Verificando se upload foi bem-sucedido...")
-        
-        try:
-            # Encontra a linha do usuário
-            row_xpath = (
-                f"//table[@id='tabelaListagem']//tr["
-                f"  td[4]//a[normalize-space()='{nome}'] and "
-                f"  .//td[normalize-space()='{preco}']"
-                f"]"
-            )
-            
-            row = self.driver.find_element(By.XPATH, row_xpath)
-            
-            # Verifica se existe checkbox na linha (upload bem-sucedido)
-            try:
-                checkbox = row.find_element(By.XPATH, ".//*[@id='chkGuia[]']")
-                print("  ✓ Upload confirmado: checkbox encontrado!")
-                return True
-            except Exception:
-                pass
-            
-            # Verifica se existe imagem (upload não realizado)
-            try:
-                img = row.find_element(By.XPATH, ".//*[@id='foo']/img")
-                print("  ✗ Upload não confirmado: imagem ainda presente (upload não realizado)")
-                return False
-            except Exception:
-                pass
-            
-            # Se não encontrou nem checkbox nem imagem, assume que não foi processado
-            print("  ✗ Não foi possível determinar o status do upload (assumindo não processado)")
-            return False
-            
-        except Exception as e:
-            print(f"  ✗ Erro ao verificar upload: {e}")
-            return False
             
     def process_file(self, file_path):
         """Processa um arquivo completo: busca usuário e faz upload.
@@ -378,27 +436,24 @@ class UniodontoProcessor:
             file_path: Caminho do arquivo a ser processado
         """
         try:
-            nome, preco, anexo, file_path = self.parse_filename(file_path)
+            nome, data, anexo, file_path = self.parse_filename(file_path)
             file_name = os.path.basename(file_path)
             
             print(f"\n{'='*60}")
             print(f"Processando: {file_name}")
             print(f"Nome: {nome}")
-            print(f"Preço: R$ {preco}")
+            print(f"Data: {data}")
             print(f"Tipo: {anexo}")
             
             # Volta para a página de busca e refaz a pesquisa
             self.return_to_search_page()
+            sleep(2)
             self.prepare_search_filters()
+            sleep(1)
             self.search_guides()
             
-            # Verifica se o arquivo já foi processado (checkbox presente)
-            if self.verify_upload_success(nome, preco):
-                print(f"  ⚠ Arquivo já foi processado anteriormente (checkbox encontrado). Pulando...")
-                return True
-            
             # Busca e clica no usuário
-            if not self.find_and_click_user(nome, preco):
+            if not self.find_and_click_user(nome, data):
                 print(f"  ✗ Não foi possível encontrar o usuário. Pulando arquivo.")
                 return False
             
@@ -417,18 +472,8 @@ class UniodontoProcessor:
             if not self.complete_upload():
                 return False
             
-            # Volta para página de busca e verifica se deu certo
-            self.return_to_search_page()
-            self.prepare_search_filters()
-            self.search_guides()
-            
-            # Verifica se o upload foi bem-sucedido
-            if self.lce_upload_success(nome, preco):
-                print(f"✓ Arquivo processado e confirmado com sucesso!")
-                return True
-            else:
-                print(f"⚠ Arquivo processado mas upload não confirmado na verificação")
-                return False
+            print(f"✓ Arquivo processado com sucesso!")
+            return True
             
         except Exception as e:
             print(f"✗ Erro ao processar arquivo {file_path}: {e}")
@@ -466,8 +511,8 @@ class UniodontoProcessor:
             self.navigate_to_lote_generation()
             
             # Prepara filtros e busca inicial (para confirmar que está tudo OK)
-            self.prepare_search_filters()
-            self.search_guides()
+            # self.prepare_search_filters()
+            # self.search_guides()
             
             # Processa cada arquivo
             successful = 0
@@ -478,8 +523,6 @@ class UniodontoProcessor:
                 
                 result = self.process_file(file_path)
                 if result:
-                    # Verifica se foi sucesso ou pulado (já processado)
-                    # A lógica de verificação está dentro de process_file
                     successful += 1
                 else:
                     failed += 1

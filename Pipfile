@@ -8,6 +8,10 @@ python-telegram-bot = "==21.4"
 dotenv = "*"
 selenium = "*"
 requests = "*"
+pillow = "*"
+pytesseract = "*"
+openai = "*"
+ipdb = "*"
 
 [dev-packages]
 ipykernel = "*"

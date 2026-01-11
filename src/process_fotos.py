@@ -1,561 +1,431 @@
-#!/usr/bin/env python3
-"""
-Script para processar automaticamente todas as fotos na pasta fotos/
-e fazer upload no site Uniodonto para cada usuário correspondente.
-"""
-
 import os
-from pathlib import Path
-from time import sleep
-from datetime import datetime
-from urllib.parse import urljoin
-
+import time
 import requests
+import logging
+from pathlib import Path
+from urllib.parse import urljoin
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from datetime import datetime
 
-# Carrega variáveis de ambiente
-load_dotenv()
-
-# Configurações
-FOTOS_DIR = Path(__file__).parent.parent / "fotos"
-
-# Validação de variáveis de ambiente
-def get_env_var(name: str, required: bool = True) -> str:
-    """Obtém variável de ambiente com validação.
-    
-    Args:
-        name: Nome da variável de ambiente
-        required: Se True, lança exceção se variável não existir ou estiver vazia
-        
-    Returns:
-        Valor da variável de ambiente
-        
-    Raises:
-        ValueError: Se variável for obrigatória e não existir ou estiver vazia
-    """
-    value = os.getenv(name)
-    if required and (value is None or value.strip() == ""):
-        raise ValueError(
-            f"Variável de ambiente '{name}' não está definida ou está vazia. "
-            f"Verifique seu arquivo .env"
-        )
-    return value
-
-CPF_TALUDE = get_env_var("CPF_TALUDE")
-COD_UNIODONTO = get_env_var("COD_UNIODONTO")
-PASSWORD = get_env_var("PASSWORD")
-
-
-class UniodontoProcessor:
-    """Classe para processar fotos no site Uniodonto."""
-    
+class UniodontoCrawler:
     def __init__(self):
+        load_dotenv()
+        self.cpf = str(os.getenv("CPF_TALUDE"))
+        self.codigo = str(os.getenv("COD_UNIODONTO"))
+        self.senha = str(os.getenv("PASSWORD"))
+        self.diretorio_fotos = Path('/Users/enzobarbi/Development/Projects/guias-uniodonto/fotos')
         self.driver = None
         self.wait = None
         
-    def setup_driver(self):
-        """Configura e inicializa o driver do Selenium."""
-        opts = Options()
-        # opts.add_argument("--headless=new")  # descomente para rodar sem interface
-        opts.add_argument("--start-maximized")  # Inicia maximizado
-        opts.add_experimental_option("detach", True)  # Mantém navegador aberto mesmo em caso de erro
+        # Configurar logging
+        self.configurar_logging()
         
-        self.driver = webdriver.Chrome(options=opts)
-        self.wait = WebDriverWait(self.driver, 20)
-        print("✓ Driver configurado")
+        # Contadores para relatório final
+        self.total_arquivos = 0
+        self.processados_sucesso = 0
+        self.processados_erro = 0
+        self.arquivos_nao_encontrados = 0
+        self.erros_detalhados = []
         
-    def login(self):
-        """Faz login no site Uniodonto."""
-        print("\n=== Fazendo login ===")
-        self.driver.get("https://www.uniodontosc.coop.br/cooperados/index.php")
-        sleep(3)
+    def configurar_logging(self):
+        """Configura o sistema de logging"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"uniodonto_crawler_{timestamp}.log"
         
-        # Preenche CPF
-        cpf_bar = self.driver.find_element(By.ID, 'campoCpf')
-        sleep(1)
-        for numero in CPF_TALUDE:
-            sleep(0.5)
-            cpf_bar.send_keys(numero)
-        
-        # Preenche código
-        cod_bar = self.driver.find_element(By.ID, 'campoCodigo')
-        sleep(1)
-        cod_bar.send_keys(COD_UNIODONTO)
-        
-        # Preenche senha
-        paswd_bar = self.driver.find_element(By.ID, 'campoSenha')
-        paswd_bar.send_keys(PASSWORD)
-        
-        sleep(3)
-        
-        # Clica no botão de login
-        login_button = self.driver.find_element(
-            By.XPATH, '/html/body/div[2]/section/div[3]/div/div/div/div/form/div/div[4]/div/div/button'
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_filename, encoding='utf-8'),
+                logging.StreamHandler()
+            ]
         )
-        login_button.click()
-        sleep(1.5)
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Sistema de logging inicializado")
         
-        # Fecha o anúncio se existir
+    def inicializar_driver(self):
+        """Inicializa o driver do Chrome"""
+        self.logger.info("Inicializando driver do Chrome...")
         try:
+            opts = Options()
+            opts.add_argument("--start-maximized")
+            opts.add_experimental_option("detach", True)
+            
+            self.driver = webdriver.Chrome(options=opts)
+            self.wait = WebDriverWait(self.driver, 10)
+            self.logger.info("Driver inicializado com sucesso")
+            return True
+        except Exception as e:
+            self.logger.error(f"Erro ao inicializar driver: {e}")
+            return False
+        
+    def fazer_login(self):
+        """Realiza o login no sistema"""
+        self.logger.info("Iniciando processo de login...")
+        try:
+            self.driver.get("https://www.uniodontosc.coop.br/cooperados/index.php")
+            time.sleep(3)
+            
+            # Preencher campos
+            self.logger.info("Preenchendo campos de login...")
+            cpf_bar = self.driver.find_element(By.ID, 'campoCpf')
+            cod_bar = self.driver.find_element(By.ID, 'campoCodigo')
+            paswd_bar = self.driver.find_element(By.ID, 'campoSenha')
+            
+            # Digitar CPF com delay
+            for numero in self.cpf:
+                time.sleep(0.5)
+                cpf_bar.send_keys(numero)
+                
+            cod_bar.send_keys(self.codigo)
+            paswd_bar.send_keys(self.senha)
+            time.sleep(3)
+            
+            # Fazer login
+            login_button = self.driver.find_element(By.XPATH, '/html/body/div[2]/section/div[3]/div/div/div/div/form/div/div[4]/div/div/button')
+            login_button.click()
+            time.sleep(1.5)
+            
+            # Fechar popup
             close_add_button = self.driver.find_element(By.XPATH, '/html/body/div[1]/div[1]/div/a')
             close_add_button.click()
-            sleep(1.5)
-        except Exception:
-            pass
+            time.sleep(1.5)
+            
+            self.logger.info("Login realizado com sucesso")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Erro durante login: {e}")
+            return False
         
-        print("✓ Login realizado com sucesso")
-        
-    def navigate_to_lote_generation(self):
-        """Navega para a página de geração de lote."""
-        print("\n=== Navegando para geração de lote ===")
-        
-        # Clica no menu Produção
-        production_button = self.driver.find_element(
-            By.XPATH, '/html/body/div[1]/div[3]/div[2]/div/div[4]/nav/ul/li[6]/a'
-        )
-        production_button.click()
-        sleep(0.5)
-        
-        # Clica em Geração de Lote
-        lote_generation = self.driver.find_element(
-            By.XPATH, '/html/body/div[1]/div[3]/div[2]/div/div[4]/nav/ul/li[6]/ul/li[1]/a'
-        )
-        lote_generation.click()
-        sleep(2)
-        
-        print("✓ Navegação concluída")
-        
-    def prepare_search_filters(self):
-        """Prepara os filtros de busca (empresa e mês/ano)."""
-        print("\n=== Preparando filtros de busca ===")
-        
-        # Seleciona "Todos" na empresa
-        empresa_lote = self.driver.find_element(By.ID, 'empresaLote')
-        empresa_lote.click()
-        sleep(0.5)
-        
-        all_option = self.driver.find_element(
-            By.XPATH, '/html/body/form/div/div/table/tbody/tr/td/table/tbody/tr[2]/td[3]/select/option[12]'
-        )
-        all_option.click()
-        sleep(0.5)
-        
-        # Calcula mês/ano anterior
-        agora = datetime.now()
-        mes = agora.month
-        ano = agora.year
-        
-        if mes == 1:
-            mes_anterior = 12
-            ano_anterior = ano - 1
-        else:
-            mes_anterior = mes - 1
-            ano_anterior = ano
-        
-        mes_ano_str = f"{mes_anterior:02d}{ano_anterior}"
-        
-        # Preenche mês/ano
-        month_year = self.driver.find_element(By.ID, 'mesAno')
-        month_year.clear()
-        month_year.click()
-        sleep(1.5)
-        
-        for n in mes_ano_str:
-            sleep(1)
-            month_year.send_keys(int(n))
-        
-        print(f"✓ Filtros configurados (mês/ano: {mes_ano_str})")
-        return mes_ano_str
-        
-    def search_guides(self):
-        """Executa a busca de guias."""
-        search = self.driver.find_element(By.ID, 'pesquisarGuia')
-        search.click()
-        sleep(2)
-        
-        # Espera a tabela carregar
-        self.wait.until(EC.presence_of_element_located((By.ID, "tabelaListagem")))
-        print("✓ Busca realizada")
-        
-    def parse_filename(self, file_path):
-        """Extrai nome, data e tipo de anexo do nome do arquivo.
-        
-        Formato esperado: Nome_completo - DD-MM-YYYY - TIPO.jpg
-        Exemplo: Leticia_Jahn - 10-10-2025 - GTO.jpg
-        """
-        file_name = os.path.basename(file_path)
-        parts = file_name.split(" - ")
-        
-        if len(parts) < 3:
-            raise ValueError(f"Formato de arquivo inválido: {file_name}")
-        
-        data_name = parts[0].replace("_", " ")
-        data_date = parts[1]  # DD-MM-YYYY
-        data_anexo = parts[2].split(".")[0]  # Remove a extensão
-        
-        nome = data_name.title()
-        # Converte data de DD-MM-YYYY para DD/MM/YYYY para busca no site
-        data_site = data_date.replace("-", "/")
-        anexo = data_anexo
-        
-        return nome, data_site, anexo, file_path
-        
-    def scroll_table_to_load_all(self):
-        """Faz scroll na tabela para carregar todos os elementos."""
+    def navegar_para_lote(self):
+        """Navega para a página de geração de lote"""
+        self.logger.info("Navegando para página de geração de lote...")
         try:
-            # Encontra o container da tabela ou a própria tabela
-            table = self.driver.find_element(By.ID, "tabelaListagem")
+            production_button = self.driver.find_element(By.XPATH, '/html/body/div[1]/div[3]/div[2]/div/div[4]/nav/ul/li[6]/a')
+            production_button.click()
+            time.sleep(0.5)
             
-            # Tenta encontrar o container pai que tem o scrollbar (geralmente um div ou tbody)
-            container = None
-            try:
-                # Primeiro tenta encontrar um container com scrollbar
-                container = table.find_element(By.XPATH, "./ancestor::div[contains(@style, 'overflow')]")
-            except:
-                try:
-                    # Se não encontrar, tenta o tbody
-                    container = table.find_element(By.TAG_NAME, "tbody")
-                except:
-                    # Se não encontrar, usa a própria tabela
-                    container = table
+            lote_generation = self.driver.find_element(By.XPATH, '/html/body/div[1]/div[3]/div[2]/div/div[4]/nav/ul/li[6]/ul/li[1]/a')
+            lote_generation.click()
+            time.sleep(2)
             
-            # Obtém a altura inicial
-            last_height = self.driver.execute_script("return arguments[0].scrollHeight", container)
-            scroll_attempts = 0
-            max_scroll_attempts = 20  # Limite de tentativas para evitar loop infinito
+            self.logger.info("Configurando filtros de busca...")
+            # Configurar filtros
+            empresa_lote = self.driver.find_element(By.ID, 'empresaLote')
+            empresa_lote.click()
+            all_option = self.driver.find_element(By.XPATH, '/html/body/form/div/div/table/tbody/tr/td/table/tbody/tr[2]/td[3]/select/option[12]')
+            all_option.click()
             
-            print("  → Carregando toda a tabela (fazendo scroll)...")
+            month_year = self.driver.find_element(By.ID, 'mesAno')
+            mesano = '102025'
+            month_year.clear()
+            month_year.click()
+            time.sleep(1.5)
             
-            while scroll_attempts < max_scroll_attempts:
-                # Faz scroll até o final do container
-                self.driver.execute_script(
-                    "arguments[0].scrollTop = arguments[0].scrollHeight;",
-                    container
-                )
-                sleep(0.5)  # Aguarda elementos carregarem
+            for n in mesano:
+                time.sleep(1)
+                month_year.send_keys(int(n))
                 
-                # Verifica nova altura
-                new_height = self.driver.execute_script("return arguments[0].scrollHeight", container)
+            search = self.driver.find_element(By.ID, 'pesquisarGuia')
+            search.click()
+            time.sleep(3)
+            
+            self.logger.info("Navegação para lote concluída")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao navegar para lote: {e}")
+            return False
+        
+    def obter_protocolos_arquivos(self):
+        """Mapeia os protocolos disponíveis nos arquivos"""
+        self.logger.info("Mapeando protocolos disponíveis nos arquivos...")
+        try:
+            arquivos = [arquivo.name for arquivo in self.diretorio_fotos.iterdir() if arquivo.is_file()]
+            protocolos_disponiveis = {}
+            
+            for arquivo in arquivos:
+                partes = arquivo.split(' - ')
+                if len(partes) >= 2:
+                    protocolo = partes[1].strip()
+                    # Verificar se é arquivo GTO
+                    tipo_anexo = partes[-1].split(".")[0] if len(partes) >= 5 else ""
+                    if tipo_anexo == "GTO":
+                        protocolos_disponiveis[protocolo] = arquivo
+                        
+            self.total_arquivos = len(protocolos_disponiveis)
+            self.logger.info(f"Encontrados {self.total_arquivos} arquivos GTO para processamento")
+            
+            for protocolo, arquivo in protocolos_disponiveis.items():
+                self.logger.info(f"  - Protocolo: {protocolo} | Arquivo: {arquivo}")
                 
-                # Se a altura não mudou, significa que chegou ao final
-                if new_height == last_height:
-                    break
-                
-                last_height = new_height
-                scroll_attempts += 1
-            
-            # Faz scroll de volta para o topo para facilitar a visualização
-            self.driver.execute_script("arguments[0].scrollTop = 0;", container)
-            sleep(0.5)
-            
-            print(f"  ✓ Tabela totalmente carregada ({scroll_attempts} tentativas de scroll)")
-            return True
+            return protocolos_disponiveis
             
         except Exception as e:
-            print(f"  ⚠ Aviso ao fazer scroll na tabela: {e}")
-            return False
-    
-    def find_and_click_user(self, nome, data):
-        """Encontra e clica no usuário correto na tabela."""
-        print(f"\n  → Procurando: {nome} ({data})")
+            self.logger.error(f"Erro ao mapear protocolos: {e}")
+            return {}
         
-        # Primeiro, faz scroll para carregar toda a tabela
-        self.scroll_table_to_load_all()
-        
-        # XPath para encontrar a linha que tem o nome e a data
-        # No site: coluna 3 (td[3]) tem a data, coluna 4 (td[4]) tem o nome
-        row_xpath = (
-            f"//table[@id='tabelaListagem']//tr["
-            f"  td[4]//a[normalize-space()='{nome}'] and "
-            f"  td[3][normalize-space()='{data}']"
-            f"]"
-        )
-        
-
+    def obter_linhas_tabela(self):
+        """Obtém as linhas da tabela de guias"""
         try:
-            # Tenta encontrar o elemento
-            row = self.driver.find_element(By.XPATH, row_xpath)
-            link = row.find_element(By.XPATH, "td[4]//a")
-            
-            # Faz scroll até o elemento para garantir que está visível
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
-            sleep(0.5)
-            
-            try:
-                self.wait.until(EC.element_to_be_clickable(link)).click()
-            except Exception:
-                # Se houver overlay, força clique via JS
-                self.driver.execute_script("arguments[0].click();", link)
-            
-            print(f"  ✓ Usuário encontrado e clicado")
-            sleep(3)
-            return True
-            
+            self.logger.info("Localizando tabela de guias...")
+            tabela = self.driver.find_element(By.XPATH, '//*[@id="tabelaListagem"]')
+            linhas = tabela.find_elements(By.XPATH, './/tbody/tr')
+            self.logger.info(f"Encontradas {len(linhas)} linhas na tabela")
+            return linhas
         except Exception as e:
-            print(f"  ✗ Erro ao encontrar usuário: {e}")
-            return False
-            
-    def click_anexo_button(self, anexo):
-        """Clica no botão de anexo correto (RX ou GTO)."""
-        print(f"  → Clicando em anexo: {anexo}")
+            self.logger.error(f"Erro ao localizar tabela: {e}")
+            return []
         
-        rx_button = self.driver.find_element(By.ID, "AnexarRx1")
-        gto_button = self.driver.find_element(By.ID, "AnexarRx2")
+    def processar_guias(self):
+        """Processa todas as guias disponíveis"""
+        self.logger.info("Iniciando processamento das guias...")
+        protocolos_disponiveis = self.obter_protocolos_arquivos()
         
-        if anexo == "GTO":
-            gto_button.click()
-        elif anexo == "RX":
-            rx_button.click()
-        else:
-            raise ValueError(f"Tipo de anexo desconhecido: {anexo}")
-        
-        print(f"  ✓ Botão {anexo} clicado")
-        
-    def navigate_to_upload_page(self):
-        """Navega para a página de upload (via iframe)."""
-        print("  → Navegando para página de upload")
-        
-        # Encontra o iframe
-        iframe = self.wait.until(EC.presence_of_element_located((
-            By.CSS_SELECTOR, "iframe#TB_iframeContent, iframe[src*='imagens_lote_guias.php']"
-        )))
-        
-        src = iframe.get_attribute("src")
-        src_abs = urljoin(self.driver.current_url, src)
-        
-        # Navega direto para a URL do iframe
-        self.driver.get(src_abs)
-        print("  ✓ Navegação concluída")
-        
-    def upload_file(self, file_path, file_name):
-        """Faz upload do arquivo usando requests."""
-        print(f"  → Fazendo upload: {file_name}")
-        
-        # Extrai código de controle da URL
-        url_atual = self.driver.current_url
-        if "controle=" not in url_atual:
-            print(f"  ✗ Erro: URL não contém parâmetro 'controle'")
-            return False
-        
-        codigo = url_atual.split("controle=")[1].split("&")[0]
-        
-        # Obtém cookies do Selenium
-        try:
-            cookie = self.driver.get_cookie('PHPSESSID')
-            if not cookie or 'value' not in cookie:
-                print(f"  ✗ Erro: Cookie PHPSESSID não encontrado")
-                return False
-            phpsessid = cookie['value']
-        except Exception as e:
-            print(f"  ✗ Erro ao obter cookie: {e}")
-            return False
-        
-        # Configura upload via requests
-        url_upload = "https://www.sisoweb.coop.br/web/cooperados/upload.process.imagens.php"
-        
-        headers = {
-            'accept': 'application/json, text/javascript, */*; q=0.01',
-            'x-requested-with': 'XMLHttpRequest',
-            'referer': url_atual
-        }
-        
-        cookies = {
-            'PHPSESSID': phpsessid,
-            'loginCooperados': '1'
-        }
-        
-        data = {
-            'controle': codigo,
-            'baixada': 'f',
-            'liberada': 'f',
-            'pendente': 'f'
-        }
-        
-        # Faz upload
-        with open(file_path, 'rb') as f:
-            files = {
-                'files[]': (file_name, f, 'image/jpeg')
-            }
-            response = requests.post(
-                url_upload, 
-                data=data, 
-                files=files, 
-                headers=headers, 
-                cookies=cookies, 
-                timeout=120
-            )
-        
-        if response.status_code == 200:
-            print(f"  ✓ Upload realizado com sucesso")
-            # Recarrega página
-            sleep(2)
-            self.driver.refresh()
-            sleep(2)
-            return True
-        else:
-            print(f"  ✗ Erro no upload: Status {response.status_code}")
-            return False
-            
-    def complete_upload(self):
-        """Completa o processo de upload selecionando procedimento e enviando."""
-        print("  → Completando upload")
-        
-        # Seleciona a segunda opção do select de procedimento
-        try:
-            element = self.driver.find_element(By.XPATH, "//*[starts-with(@id, 'procedimento')]/option[2]")
-            element.click()
-            sleep(1)
-            
-            # Clica no botão de concluir
-            button_concluir = self.driver.find_element(By.XPATH, '//*[@id="btnEnviarArquivoImagem"]')
-            button_concluir.click()
-            sleep(2)
-            
-            print("  ✓ Upload finalizado")
-            return True
-        except Exception as e:
-            print(f"  ✗ Erro ao finalizar upload: {e}")
-            return False
-    
-    def return_to_search_page(self):
-        """Volta para a página de busca de guias."""
-        print("  → Voltando para página de busca")
-        self.driver.get("https://www.sisoweb.coop.br/web/cooperados/gerar.lote.php#")
-        sleep(2)
-        print("  ✓ Retornou para página de busca")
-            
-    def process_file(self, file_path):
-        """Processa um arquivo completo: busca usuário e faz upload.
-        
-        Args:
-            file_path: Caminho do arquivo a ser processado
-        """
-        try:
-            nome, data, anexo, file_path = self.parse_filename(file_path)
-            file_name = os.path.basename(file_path)
-            
-            print(f"\n{'='*60}")
-            print(f"Processando: {file_name}")
-            print(f"Nome: {nome}")
-            print(f"Data: {data}")
-            print(f"Tipo: {anexo}")
-            
-            # Volta para a página de busca e refaz a pesquisa
-            self.return_to_search_page()
-            sleep(2)
-            self.prepare_search_filters()
-            sleep(1)
-            self.search_guides()
-            
-            # Busca e clica no usuário
-            if not self.find_and_click_user(nome, data):
-                print(f"  ✗ Não foi possível encontrar o usuário. Pulando arquivo.")
-                return False
-            
-            # Clica no botão de anexo correto
-            self.click_anexo_button(anexo)
-            sleep(1)
-            
-            # Navega para página de upload
-            self.navigate_to_upload_page()
-            
-            # Faz upload
-            if not self.upload_file(file_path, file_name):
-                return False
-            
-            # Completa o upload
-            if not self.complete_upload():
-                return False
-            
-            print(f"✓ Arquivo processado com sucesso!")
-            return True
-            
-        except Exception as e:
-            print(f"✗ Erro ao processar arquivo {file_path}: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-            
-    def process_all_files(self):
-        """Processa todos os arquivos na pasta fotos/."""
-        print("\n" + "="*60)
-        print("INICIANDO PROCESSAMENTO DE FOTOS")
-        print("="*60)
-        
-        # Lista arquivos de imagem
-        image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
-        files = [
-            f for f in FOTOS_DIR.glob("*")
-            if f.is_file() and f.suffix.lower() in image_extensions
-        ]
-        
-        if not files:
-            print(f"Nenhum arquivo encontrado em {FOTOS_DIR}")
+        if not protocolos_disponiveis:
+            self.logger.warning("Nenhum arquivo GTO encontrado para processamento")
             return
         
-        print(f"\nEncontrados {len(files)} arquivo(s) para processar\n")
+        protocolos_processados = set()
         
-        # Setup inicial
-        self.setup_driver()
+        while len(protocolos_processados) < len(protocolos_disponiveis):
+            linhas = self.obter_linhas_tabela()
+            
+            if not linhas:
+                self.logger.error("Não foi possível obter linhas da tabela")
+                break
+                
+            protocolo_encontrado = False
+            
+            for linha in linhas:
+                celulas = linha.find_elements(By.TAG_NAME, 'td')
+                
+                if len(celulas) >= 5:
+                    protocolo = celulas[1].text.strip()
+                    
+                    # Verificar se protocolo está disponível e ainda não foi processado
+                    if protocolo in protocolos_disponiveis and protocolo not in protocolos_processados:
+                        self.logger.info(f"Processando protocolo: {protocolo}")
+                        
+                        beneficiario = celulas[3].text.strip()
+                        data = celulas[2].text.strip()
+                        valor = celulas[4].text.strip()
+                        
+                        self.logger.info(f"  Beneficiário: {beneficiario}")
+                        self.logger.info(f"  Data: {data}")
+                        self.logger.info(f"  Valor: {valor}")
+                        
+                        if self.processar_guia_individual(protocolo, protocolos_disponiveis[protocolo], celulas):
+                            self.processados_sucesso += 1
+                            self.logger.info(f"Guia {protocolo} processada com sucesso")
+                            
+                            # Deletar arquivo após sucesso
+                            self.deletar_arquivo(protocolos_disponiveis[protocolo])
+                        else:
+                            self.processados_erro += 1
+                            self.logger.error(f"Erro ao processar guia {protocolo}")
+                            
+                        protocolos_processados.add(protocolo)
+                        protocolo_encontrado = True
+                        
+                        # Voltar para a lista
+                        self.logger.info("Retornando para lista de guias...")
+                        self.driver.get("https://www.sisoweb.coop.br/web/cooperados/gerar.lote.php")
+                        time.sleep(12)  # Sleep maior conforme solicitado
+                        break
+                        
+            if not protocolo_encontrado:
+                self.logger.warning("Nenhum protocolo pendente encontrado na tabela atual")
+                break
+                
+        # Verificar protocolos não encontrados
+        for protocolo in protocolos_disponiveis:
+            if protocolo not in protocolos_processados:
+                self.arquivos_nao_encontrados += 1
+                self.logger.warning(f"Protocolo {protocolo} não encontrado na tabela do sistema")
+                
+        self.logger.info("Processamento de guias concluído")
+        
+    def processar_guia_individual(self, protocolo, arquivo_nome, celulas):
+        """Processa uma guia individual"""
+        try:
+            self.logger.info(f"Clicando na linha do protocolo {protocolo}")
+            celulas[1].click()
+            time.sleep(3)
+            
+            # Clicar no botão GTO
+            self.logger.info("Clicando no botão de anexo GTO")
+            gto_button = self.driver.find_element(By.ID, "AnexarRx2")
+            gto_button.click()
+            
+            # Fazer upload
+            if self.fazer_upload(protocolo, arquivo_nome):
+                self.finalizar_upload()
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            erro_msg = f"Erro ao processar guia {protocolo}: {e}"
+            self.logger.error(erro_msg)
+            self.erros_detalhados.append(erro_msg)
+            return False
+            
+    def fazer_upload(self, protocolo, arquivo_nome):
+        """Realiza o upload do arquivo"""
+        self.logger.info(f"Iniciando upload do arquivo: {arquivo_nome}")
+        try:
+            # Navegar para iframe
+            iframe = self.wait.until(EC.presence_of_element_located((
+                By.CSS_SELECTOR, "iframe#TB_iframeContent, iframe[src*='imagens_lote_guias.php']"
+            )))
+            
+            src = iframe.get_attribute("src")
+            src_abs = urljoin(self.driver.current_url, src)
+            self.driver.get(src_abs)
+            self.logger.info("Navegação para página de upload concluída")
+            
+            # Preparar upload via requests
+            url_atual = self.driver.current_url
+            
+            if "controle=" not in url_atual:
+                self.logger.error("URL não contém parâmetro 'controle'")
+                return False
+                
+            codigo = url_atual.split("controle=")[1].split("&")[0]
+            
+            cookie = self.driver.get_cookie('PHPSESSID')
+            if not cookie or 'value' not in cookie:
+                self.logger.error("Cookie PHPSESSID não encontrado")
+                return False
+                
+            phpsessid = cookie['value']
+            arquivo_path = os.path.join(self.diretorio_fotos, arquivo_nome)
+            
+            # Fazer upload
+            url_upload = "https://www.sisoweb.coop.br/web/cooperados/upload.process.imagens.php"
+            
+            headers = {
+                'accept': 'application/json, text/javascript, */*; q=0.01',
+                'x-requested-with': 'XMLHttpRequest',
+                'referer': url_atual
+            }
+            
+            cookies = {
+                'PHPSESSID': phpsessid,
+                'loginCooperados': '1'
+            }
+            
+            data = {
+                'controle': codigo,
+                'baixada': 'f',
+                'liberada': 'f',
+                'pendente': 'f'
+            }
+            
+            with open(arquivo_path, 'rb') as f:
+                files = {
+                    'files[]': (arquivo_nome, f, 'image/jpeg')
+                }
+                response = requests.post(
+                    url_upload, 
+                    data=data, 
+                    files=files, 
+                    headers=headers, 
+                    cookies=cookies, 
+                    timeout=120
+                )
+            
+            if response.status_code == 200:
+                self.logger.info("Upload realizado com sucesso")
+                time.sleep(2)
+                self.driver.refresh()
+                time.sleep(2)
+                return True
+            else:
+                self.logger.error(f"Erro no upload: Status {response.status_code}")
+                return False
+                
+        except Exception as e:
+            erro_msg = f"Erro durante upload do protocolo {protocolo}: {e}"
+            self.logger.error(erro_msg)
+            self.erros_detalhados.append(erro_msg)
+            return False
+            
+    def finalizar_upload(self):
+        """Finaliza o processo de upload"""
+        try:
+            self.logger.info("Finalizando processo de upload")
+            element = self.driver.find_element(By.XPATH, "//*[starts-with(@id, 'procedimento')]/option[2]")
+            element.click()
+            
+            button_concluir = self.driver.find_element(By.XPATH, '//*[@id="btnEnviarArquivoImagem"]')
+            button_concluir.click()
+            time.sleep(2)
+            self.logger.info("Upload finalizado")
+            
+        except Exception as e:
+            erro_msg = f"Erro ao finalizar upload: {e}"
+            self.logger.error(erro_msg)
+            self.erros_detalhados.append(erro_msg)
+            
+    def deletar_arquivo(self, arquivo_nome):
+        """Deleta o arquivo após processamento bem-sucedido"""
+        try:
+            arquivo_path = os.path.join(self.diretorio_fotos, arquivo_nome)
+            os.remove(arquivo_path)
+            self.logger.info(f"Arquivo deletado: {arquivo_nome}")
+        except Exception as e:
+            self.logger.warning(f"Não foi possível deletar arquivo {arquivo_nome}: {e}")
+            
+    def gerar_relatorio_final(self):
+        """Gera relatório final do processamento"""
+        self.logger.info("=" * 60)
+        self.logger.info("RELATÓRIO FINAL DE PROCESSAMENTO")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Total de arquivos GTO encontrados: {self.total_arquivos}")
+        self.logger.info(f"Processados com sucesso: {self.processados_sucesso}")
+        self.logger.info(f"Processados com erro: {self.processados_erro}")
+        self.logger.info(f"Não encontrados na tabela: {self.arquivos_nao_encontrados}")
+        self.logger.info(f"Taxa de sucesso: {(self.processados_sucesso/self.total_arquivos*100):.1f}%" if self.total_arquivos > 0 else "N/A")
+        
+        if self.erros_detalhados:
+            self.logger.info("\nERROS DETALHADOS:")
+            for erro in self.erros_detalhados:
+                self.logger.info(f"  - {erro}")
+                
+        self.logger.info("=" * 60)
+        
+    def executar(self):
+        """Executa o processo completo"""
+        self.logger.info("Iniciando execução do crawler Uniodonto")
         
         try:
-            # Login uma única vez
-            self.login()
-            
-            # Navega para página de lote
-            self.navigate_to_lote_generation()
-            
-            # Prepara filtros e busca inicial (para confirmar que está tudo OK)
-            # self.prepare_search_filters()
-            # self.search_guides()
-            
-            # Processa cada arquivo
-            successful = 0
-            failed = 0
-            
-            for i, file_path in enumerate(files, 1):
-                print(f"\n[{i}/{len(files)}]")
+            if not self.inicializar_driver():
+                return
                 
-                result = self.process_file(file_path)
-                if result:
-                    successful += 1
-                else:
-                    failed += 1
+            if not self.fazer_login():
+                return
                 
-                # Pequena pausa entre arquivos
-                if i < len(files):
-                    sleep(2)
+            if not self.navegar_para_lote():
+                return
+                
+            self.processar_guias()
             
-            # Resumo final
-            print("\n" + "="*60)
-            print("RESUMO DO PROCESSAMENTO")
-            print("="*60)
-            print(f"Total de arquivos: {len(files)}")
-            print(f"Sucesso: {successful}")
-            print(f"Falhas: {failed}")
-            print("="*60)
-            
-        except KeyboardInterrupt:
-            print("\n\nProcessamento interrompido pelo usuário.")
         except Exception as e:
-            print(f"\nErro fatal: {e}")
-            import traceback
-            traceback.print_exc()
+            self.logger.error(f"Erro crítico durante execução: {e}")
         finally:
-            print("\nMantendo o navegador aberto. Feche manualmente quando terminar.")
-            # self.driver.quit()  # Descomente se quiser fechar automaticamente
-
-
-def main():
-    """Função principal."""
-    processor = UniodontoProcessor()
-    processor.process_all_files()
-
+            self.gerar_relatorio_final()
+            if self.driver:
+                input("Pressione Enter para fechar o navegador...")
+                self.driver.quit()
 
 if __name__ == "__main__":
-    main()
+    crawler = UniodontoCrawler()
+    crawler.executar()

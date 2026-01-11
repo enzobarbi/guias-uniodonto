@@ -1,12 +1,17 @@
 import os
 import re
+import asyncio
+import base64
+import json
+import shutil
+import tempfile
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
+from contextlib import contextmanager
 
 from telegram import Update, Message, PhotoSize, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
 from dotenv import load_dotenv
 from telegram.ext import (
     Application,
@@ -19,383 +24,545 @@ from telegram.ext import (
 )
 from warnings import filterwarnings
 from telegram.warnings import PTBUserWarning
+from openai import OpenAI
 
-# Configurar logging
+# ----- CONFIGURAÇÃO DE LOGGING -----
 logging.basicConfig(
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
+# ----- FILTROS DE WARNING -----
 filterwarnings(
     "ignore",
     category=PTBUserWarning,
     message=r"If 'per_message=False', 'CallbackQueryHandler' will not be tracked"
 )
 
-load_dotenv(override=True)
+# ----- CARREGAMENTO DE VARIÁVEIS DE AMBIENTE -----
+load_dotenv()
+
+# ----- CLIENTE OPENAI -----
+_openai_api_key = os.getenv("OPENAI_API_KEY")
+if not _openai_api_key:
+    raise RuntimeError("Defina a variável de ambiente OPENAI_API_KEY no arquivo .env")
+
+openai_client = OpenAI(api_key=_openai_api_key)
 
 # ----- ESTADOS DA CONVERSA -----
-WAITING_PHOTO, WAITING_DOC_TYPE = range(2)
+WAITING_PHOTO, WAITING_CONFIRMATION = range(2)
 
-DOWNLOAD_DIR = Path("/Users/enzobarbi/Development/github/guias-uniodonto/fotos")
+# ----- DIRETÓRIO DE DOWNLOADS -----
+DOWNLOAD_DIR = Path("fotos")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# --------- CONTEXT MANAGERS ---------
+
+@contextmanager
+def temp_image_file(ext=".jpg"):
+    """
+    Context manager para garantir limpeza de arquivos temporários.
+    Garante que o arquivo será deletado mesmo em caso de erro.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        yield tmp_path
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+                logger.debug(f"Arquivo temporário removido: {tmp_path}")
+            except Exception as e:
+                logger.warning(f"Falha ao remover arquivo temporário {tmp_path}: {e}")
 
 # --------- HELPERS ---------
 
 def sanitize_filename_component(text: str) -> str:
+    """
+    Remove caracteres inválidos de nomes de arquivo e limita o tamanho.
+    
+    Args:
+        text: Texto a ser sanitizado
+        
+    Returns:
+        String segura para uso em nome de arquivo
+    """
+    if not text:
+        return ""
+    
     text = text.strip()
+    # Remove caracteres especiais, mantendo apenas alfanuméricos, espaços, hífen, ponto, vírgula e ponto-e-vírgula
     text = re.sub(r"[^\w\s\-.,;]", "", text, flags=re.UNICODE)
+    # Substitui múltiplos espaços por underscore
     text = re.sub(r"\s+", "_", text)
+    # Limita tamanho para evitar problemas com sistemas de arquivo
     return text[:80]
 
-def escape_markdown_v2(text: str) -> str:
-    """Escapa caracteres especiais para Markdown V2"""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\1', text)
-
-def parse_date(text: str) -> Optional[str]:
-    """Valida e retorna a data no formato DD/MM/YYYY."""
+def parse_currency(text: str) -> str:
+    """
+    Converte texto para formato brasileiro R$ X.XXX,XX
+    
+    Exemplos:
+        "65.00" → "65,00"
+        "1500,50" → "1.500,50"
+        "1.500.50" → "1.500,50"
+    
+    Args:
+        text: Valor em formato textual
+        
+    Returns:
+        Valor formatado no padrão brasileiro ou "0,00" se inválido
+    """
     if not text:
-        return None
-    text = text.strip()
-    # Verifica formato DD/MM/YYYY
-    pattern = r"^(\d{2})/(\d{2})/(\d{4})$"
-    match = re.match(pattern, text)
-    if not match:
-        return None
+        return "0,00"
     
-    day, month, year = match.groups()
+    # Remove tudo exceto dígitos, vírgulas e pontos
+    clean = re.sub(r"[^\d,.]", "", text.strip())
+    
+    if not clean:
+        return "0,00"
+    
+    # Normaliza para ponto decimal
+    if "," in clean and "." in clean:
+        # Formato 1.000,50 → 1000.50
+        clean = clean.replace(".", "").replace(",", ".")
+    elif "," in clean:
+        # Formato 1000,50 → 1000.50
+        clean = clean.replace(",", ".")
+    
     try:
-        # Valida se é uma data válida
-        datetime(int(year), int(month), int(day))
-        return text  # Retorna no formato DD/MM/YYYY
+        value = float(clean)
+        # Formata para padrão brasileiro
+        formatted = f"{value:,.2f}".replace(",", "TEMP").replace(".", ",").replace("TEMP", ".")
+        return formatted
     except ValueError:
-        return None
-
-def extract_name_and_date_from_caption(caption: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Extrai nome e data da legenda da foto.
-    Formato esperado: "Nome da Pessoa 15/10/2025" ou variações
-    """
-    if not caption:
-        return None, None
-    
-    caption = caption.strip()
-    
-    # Procura por padrão de data DD/MM/YYYY
-    date_pattern = r"(\d{2}/\d{2}/\d{4})"
-    date_match = re.search(date_pattern, caption)
-    
-    if not date_match:
-        return None, None
-    
-    date_str = date_match.group(1)
-    date_validated = parse_date(date_str)
-    
-    if not date_validated:
-        return None, None
-    
-    # Remove a data da caption para extrair o nome
-    name_part = re.sub(date_pattern, "", caption).strip()
-    
-    # Remove caracteres extras e espaços múltiplos
-    name_part = re.sub(r'\s+', ' ', name_part).strip()
-    
-    if not name_part:
-        return None, None
-    
-    name_clean = sanitize_filename_component(name_part)
-    
-    return name_clean, date_validated
+        logger.warning(f"Falha ao converter moeda: {text}")
+        return "0,00"
 
 def best_photo(photos: list[PhotoSize]) -> PhotoSize:
+    """Retorna a foto de maior resolução da lista."""
     return photos[-1]
 
 def timestamp_now() -> str:
+    """Retorna timestamp atual formatado."""
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+def validate_extracted_data(info: dict) -> Tuple[bool, list[str]]:
+    """
+    Valida se os dados extraídos são minimamente úteis.
+    
+    Args:
+        info: Dicionário com dados extraídos
+        
+    Returns:
+        Tupla (is_valid, lista_de_problemas)
+    """
+    problems = []
+    
+    # Valida nome
+    nome = info.get("nome", "").strip()
+    if not nome or nome == "null" or len(nome) < 3:
+        problems.append("Nome não identificado ou inválido")
+    
+    # Valida senha
+    senha = info.get("senha", "").strip()
+    if not senha or senha == "null":
+        problems.append("Senha não identificada")
+    
+    # Valida data (formato DD/MM/AAAA)
+    data = info.get("data", "").strip()
+    if not re.match(r"\d{2}/\d{2}/\d{4}", data):
+        problems.append("Data inválida ou ausente (esperado: DD/MM/AAAA)")
+    
+    # Valida valor
+    valor = info.get("valor", "").strip()
+    if not valor or valor == "null":
+        problems.append("Valor não identificado")
+    
+    return (len(problems) == 0, problems)
+
+async def extract_guia_info(image_path: str) -> dict:
+    """
+    Usa a API de visão da OpenAI para extrair informações da guia odontológica.
+    
+    Args:
+        image_path: Caminho para o arquivo de imagem
+        
+    Returns:
+        Dicionário com campos extraídos ou erro
+    """
+    logger.info(f"Iniciando extração de dados da imagem: {image_path}")
+    
+    # Converte a imagem para base64
+    try:
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode("utf-8")
+    except Exception as e:
+        logger.error(f"Erro ao ler arquivo de imagem: {e}")
+        return {"erro": f"Erro ao ler arquivo: {e}"}
+    
+    # Determina o tipo MIME baseado na extensão
+    ext = Path(image_path).suffix.lower()
+    mime_type = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg", 
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(ext, "image/jpeg")
+    
+    prompt = """
+Você é um assistente de OCR especializado em guias odontológicas brasileiras (padrão TISS).
+
+EXTRAIA EXATAMENTE os seguintes dados da imagem:
+
+1. **Senha** (Campo 5): Código alfanumérico, geralmente no formato "XXXXXXX-XXX"
+2. **Nome do Paciente** (Campo 13): Nome completo, geralmente em MAIÚSCULAS
+3. **Data** (Campo 4 - Data da Autorização): Formato DD/MM/AAAA
+4. **Valor Total** (Campo 46 - Total Quantidade US): Valor em reais (exemplo: "65,00")
+
+REGRAS IMPORTANTES:
+- Se um campo não estiver visível ou legível, retorne null (não string "null", mas valor null JSON)
+- Preserve formatação original dos valores monetários (com vírgula decimal)
+- Para datas, use exatamente o formato DD/MM/AAAA
+- Retorne APENAS o JSON, sem markdown (```), sem explicações adicionais
+
+FORMATO DE SAÍDA (JSON puro):
+{
+  "senha": "string ou null",
+  "nome": "string ou null",
+  "data": "string ou null",
+  "valor": "string ou null"
+}
+"""
+
+    try:
+        logger.info("Enviando requisição para OpenAI API...")
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+        )
+        
+        # Extrai o texto da resposta
+        response_text = response.choices[0].message.content.strip()
+        logger.debug(f"Resposta da API: {response_text}")
+        
+        # Remove possíveis markdown code blocks
+        if response_text.startswith("```"):
+            response_text = re.sub(r"^```(?:json)?\n?", "", response_text)
+            response_text = re.sub(r"\n?```$", "", response_text)
+        
+        # Parseia JSON
+        parsed = json.loads(response_text)
+        
+        # Normaliza valores null
+        for key in ["senha", "nome", "data", "valor"]:
+            if key in parsed and parsed[key] in [None, "null", "N/A", ""]:
+                parsed[key] = None
+        
+        logger.info(f"Extração bem-sucedida: {parsed}")
+        return parsed
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Erro ao parsear JSON da resposta: {e}\nResposta recebida: {response_text}")
+        return {"erro": "Resposta da IA não está em formato JSON válido"}
+        
+    except Exception as e:
+        logger.error(f"Erro na API OpenAI: {e}", exc_info=True)
+        return {"erro": f"Erro ao processar com IA: {str(e)}"}
 
 # --------- HANDLERS ---------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info(f"Comando /start recebido de {update.effective_user.id}")
+    """Handler para o comando /start."""
+    user = update.effective_user
+    logger.info(f"Usuário {user.id} ({user.username or user.first_name}) iniciou conversa")
     
-    chat_id = update.effective_chat.id
-    user_name = update.effective_user.first_name or "usuário"
-    
-    # Mensagem modificada explicando o novo formato
-    message = (
-        f"Olá, {user_name}! Envie **uma foto** da guia.\n"
-        "Na legenda da foto coloque *nome* e *data* e depois você escolhe o tipo (RX ou GTO).\n\n"
-        "📝 **Formato da legenda:** `João Silva 15/10/2025`\n"
-        "📅 **Data:** DD/MM/YYYY\n\n"
-        f"*Seu Chat ID:* `{chat_id}`\n"
-    )
-    
-    try:
-        await update.message.reply_text(
-            message,
-            parse_mode="Markdown",
-        )
-        logger.info("Mensagem de start enviada com sucesso")
-        return WAITING_PHOTO
-    except Exception as e:
-        logger.error(f"Erro ao enviar mensagem de start: {e}")
-        return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info(f"Comando /cancel recebido de {update.effective_user.id}")
-    context.user_data.clear()
-    await update.message.reply_text("Conversa cancelada. Use /start para recomeçar.")
-    return ConversationHandler.END
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Encerra o bot e envia mensagem de despedida."""
-    logger.info(f"Comando /stop recebido de {update.effective_user.id}")
-    chat_id = update.effective_chat.id
-    user_name = update.effective_user.first_name or "usuário"
-    
-    # Envia mensagem de despedida
     await update.message.reply_text(
-        f"👋 Até logo, {user_name}!\n\n"
-        "🤖 Bot encerrado. Obrigado por usar!",
+        "Olá! Envie uma *foto* da guia odontológica.\n\n"
+        "Para melhor resultado:\n"
+        "• Foto nítida e bem iluminada\n"
+        "• Guia completa no enquadramento\n"
+        "• Sem reflexos ou sombras",
         parse_mode="Markdown",
     )
+    return WAITING_PHOTO
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handler para o comando /cancel."""
+    user = update.effective_user
+    logger.info(f"Usuário {user.id} cancelou a conversa")
     
-    # Envia notificação para o admin se configurado
-    admin_chat_id = os.getenv("ADMIN_CHAT_ID")
-    if admin_chat_id and str(admin_chat_id) != str(chat_id):
+    # Limpa arquivo temporário se existir
+    temp_path = context.user_data.get("temp_photo_path")
+    if temp_path and os.path.exists(temp_path):
         try:
-            await context.bot.send_message(
-                chat_id=int(admin_chat_id),
-                text=f"🔴 Bot encerrado por {user_name} (Chat ID: {chat_id})",
-                parse_mode="Markdown",
-            )
+            os.unlink(temp_path)
+            logger.debug(f"Arquivo temporário removido na cancelamento: {temp_path}")
         except Exception as e:
-            logger.error(f"Erro ao enviar notificação de encerramento: {e}")
+            logger.warning(f"Erro ao remover arquivo temporário: {e}")
     
-    logger.info("Bot encerrado via comando /stop")
-    
-    # Para o bot
-    context.application.stop()
-    
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Conversa cancelada.\n"
+        "Use /start para recomeçar."
+    )
     return ConversationHandler.END
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info(f"Foto recebida de {update.effective_user.id}")
-    
+    """Handler para recebimento de fotos."""
     msg: Message = update.message
+    user = update.effective_user
+    
     if not msg.photo:
         await msg.reply_text("Ops, preciso de uma *foto*. Tente novamente.", parse_mode="Markdown")
         return WAITING_PHOTO
 
-    # Extrai nome e data da legenda
-    caption = msg.caption or ""
-    name, date = extract_name_and_date_from_caption(caption)
+    logger.info(f"Usuário {user.id} enviou foto para processamento")
     
-    if not name or not date:
-        await msg.reply_text(
-            "❌ Não consegui extrair o nome e data da legenda.\n\n"
-            "📝 **Formato correto:** `João Silva 15/10/2025`\n"
-            "📅 **Data:** DD/MM/YYYY\n\n"
-            "Tente enviar a foto novamente com a legenda no formato correto.",
-            parse_mode="Markdown"
-        )
-        return WAITING_PHOTO
-
-    # Salva os dados extraídos
     ph = best_photo(msg.photo)
     context.user_data["pending_photo_file_id"] = ph.file_id
-    context.user_data["name"] = name
-    context.user_data["date"] = date
     
-    logger.info(f"Dados extraídos - Nome: {name}, Data: {date}")
-
-    # Mostra botões de escolha (RX / GTO) diretamente
-    keyboard = [
-        [
-            InlineKeyboardButton("📎 Anexar RX", callback_data="RX"),
-            InlineKeyboardButton("📄 Anexar GTO Digitalizada", callback_data="GTO"),
-        ]
-    ]
-    
-    # Converte underscores de volta para espaços para exibição
-    display_name = name.replace("_", " ")
+    # Envia mensagem de processamento com etapas
+    processing_msg = await msg.reply_text(
+        "*Processando...*\n"
+        "Baixando imagem...",
+        parse_mode="Markdown"
+    )
     
     try:
-        await msg.reply_text(
-            f"✅ *Dados extraídos:*\n"
-            f"👤 *Nome:* {display_name}\n"
-            f"�� *Data:* {date}\n\n"
-            "Escolha o tipo do documento:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-    except BadRequest as e:
-        logger.error(f"Erro de BadRequest ao enviar mensagem: {e}")
-        # Fallback sem formatação Markdown
-        await msg.reply_text(
-            f"✅ Dados extraídos:\n"
-            f"👤 Nome: {display_name}\n"
-            f"📅 Data: {date}\n\n"
-            "Escolha o tipo do documento:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    except Exception as e:
-        logger.error(f"Erro inesperado ao enviar mensagem: {e}")
-        await msg.reply_text(
-            "Dados extraídos com sucesso! Escolha o tipo do documento:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    return WAITING_DOC_TYPE
-
-async def handle_doc_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe a escolha do botão (RX/GTO), baixa a foto e salva com o sufixo."""
-    logger.info(f"Tipo de documento escolhido: {update.callback_query.data}")
-    
-    query = update.callback_query
-    await query.answer()
-
-    doc_type = query.data  # "RX" ou "GTO"
-    context.user_data["doc_type"] = doc_type
-
-    # Valida dados necessários
-    file_id = context.user_data.get("pending_photo_file_id")
-    name = context.user_data.get("name")
-    date = context.user_data.get("date")
-
-    if not (file_id and name and date):
-        await query.edit_message_text("Faltam dados para salvar. Envie a foto novamente, por favor.")
-        context.user_data.clear()
-        return WAITING_PHOTO
-
-    # Baixa e salva com sufixo do tipo
-    try:
-        tg_file = await context.bot.get_file(file_id)
+        # Baixa a foto temporariamente para análise
+        tg_file = await context.bot.get_file(ph.file_id)
         ext = Path(tg_file.file_path).suffix.lower() if tg_file.file_path else ".jpg"
         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
             ext = ".jpg"
-
-        # Sanitiza a data substituindo barras por hífens para evitar problemas no sistema de arquivos
-        date_safe = date.replace("/", "-")
         
-        fname = f"{name} - {date_safe} - {doc_type}{ext}"
-        dest = DOWNLOAD_DIR / fname
-        
-        # Garante que o diretório existe
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        
-        await tg_file.download_to_drive(custom_path=str(dest))
-        
-        logger.info(f"Arquivo salvo: {dest}")
-
-        # Atualiza a mensagem dos botões para um texto final
-        try:
-            await query.edit_message_text(
-                f"✅ *Arquivo salvo como:*\n`{fname}`\n\n"
-                f"📁 *Local:* `{dest}`",
-                parse_mode="Markdown",
+        # Cria arquivo temporário usando context manager
+        with temp_image_file(ext) as tmp_path:
+            logger.debug(f"Baixando imagem para: {tmp_path}")
+            await tg_file.download_to_drive(custom_path=tmp_path)
+            
+            # Atualiza mensagem
+            await processing_msg.edit_text(
+                "*Processando...*\n"
+                "Imagem baixada. Analisando...",
+                parse_mode="Markdown"
             )
-        except BadRequest:
-            # Fallback sem formatação Markdown
-            await query.edit_message_text(
-                f"✅ Arquivo salvo como:\n{fname}\n\n"
-                f"📁 Local: {dest}"
+            
+            # Extrai informações com OpenAI
+            info = await extract_guia_info(tmp_path)
+            
+            # Copia arquivo temporário para não perder referência
+            # (o context manager vai deletar o arquivo ao sair do bloco)
+            new_tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            new_tmp_path = new_tmp.name
+            new_tmp.close()
+            shutil.copy2(tmp_path, new_tmp_path)
+        
+        # Armazena o novo caminho temporário e as informações extraídas
+        context.user_data["temp_photo_path"] = new_tmp_path
+        context.user_data["extracted_info"] = info
+        
+        # Verifica se houve erro na extração
+        if "erro" in info:
+            logger.warning(f"Erro na extração para usuário {user.id}: {info['erro']}")
+            await processing_msg.edit_text(
+                f"*Problema ao analisar a imagem:*\n\n"
+                f"`{info['erro']}`\n\n"
+                "Por favor, envie outra foto com melhor qualidade.",
+                parse_mode="Markdown"
             )
-
+            # Limpa arquivo temporário
+            if os.path.exists(new_tmp_path):
+                os.unlink(new_tmp_path)
+            return WAITING_PHOTO
+        
+        # Valida dados extraídos
+        is_valid, problems = validate_extracted_data(info)
+        
+        # Monta mensagem com informações extraídas
+        info_text = "*Informações extraídas:*\n\n"
+        info_text += f"*Nome:* {info.get('nome') or 'Não identificado'}\n"
+        info_text += f"*Senha:* {info.get('senha') or 'Não identificada'}\n"
+        info_text += f"*Data:* {info.get('data') or 'Não identificada'}\n"
+        info_text += f"*Valor:* R$ {info.get('valor') or 'Não identificado'}\n\n"
+        
+        # Adiciona avisos se houver problemas
+        if not is_valid:
+            info_text += "*Atenção - Dados incompletos:*\n"
+            for problem in problems:
+                info_text += f"• {problem}\n"
+            info_text += "\n"
+        
+        info_text += "*As informações estão corretas?*"
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("Confirmar", callback_data="CONFIRM"),
+                InlineKeyboardButton("Reenviar foto", callback_data="RETRY"),
+            ]
+        ]
+        
+        await processing_msg.edit_text(
+            info_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        
+        logger.info(f"Usuário {user.id}: Dados extraídos e aguardando confirmação")
+        return WAITING_CONFIRMATION
+        
     except Exception as e:
-        logger.error(f"Erro ao baixar/salvar foto: {e}")
-        await query.edit_message_text(f"❌ Falhou ao baixar/salvar a foto: {e}")
+        logger.error(f"Erro ao processar foto do usuário {user.id}: {e}", exc_info=True)
+        await processing_msg.edit_text(
+            f"*Erro ao processar a foto:*\n\n`{e}`\n\n"
+            "Por favor, tente novamente.",
+            parse_mode="Markdown"
+        )
+        # Limpa arquivo temporário se existir
+        if "temp_photo_path" in context.user_data:
+            temp_path = context.user_data["temp_photo_path"]
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
         return WAITING_PHOTO
 
-    # Limpa dados e volta para esperar outra foto
-    context.user_data.pop("pending_photo_file_id", None)
-    context.user_data.pop("name", None)
-    context.user_data.pop("date", None)
-    context.user_data.pop("doc_type", None)
+async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe confirmação das informações extraídas e salva o arquivo."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    
+    if query.data == "RETRY":
+        logger.info(f"Usuário {user.id} solicitou reenvio de foto")
+        
+        # Limpa dados e volta para esperar nova foto
+        temp_path = context.user_data.get("temp_photo_path")
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        context.user_data.clear()
+        
+        await query.edit_message_text(
+            "Envie uma nova foto da guia.",
+        )
+        return WAITING_PHOTO
+    
+    # CONFIRM - salva o arquivo
+    logger.info(f"Usuário {user.id} confirmou dados, salvando arquivo...")
+    
+    temp_path = context.user_data.get("temp_photo_path")
+    info = context.user_data.get("extracted_info", {})
 
-    # Manda uma mensagem fora do callback preparando para a próxima
+    if not temp_path or not os.path.exists(temp_path):
+        logger.error(f"Usuário {user.id}: Arquivo temporário não encontrado")
+        await query.edit_message_text(
+            "Faltam dados para salvar. Envie a foto novamente."
+        )
+        context.user_data.clear()
+        return WAITING_PHOTO
+
+    try:
+        # Extrai e sanitiza informações
+        nome = sanitize_filename_component(info.get("nome") or "SEM_NOME")
+        senha = sanitize_filename_component(info.get("senha") or "SEM_SENHA")
+        data = sanitize_filename_component(info.get("data") or "SEM_DATA")
+        preco_raw = info.get("valor") or "0,00"
+        
+        # Formata o preço
+        preco_fmt = parse_currency(preco_raw)
+        
+        # Monta o nome do arquivo
+        ext = Path(temp_path).suffix.lower()
+        fname = f"{nome} - {senha} - {data} - {preco_fmt} - GTO{ext}"
+        dest = DOWNLOAD_DIR / fname
+        
+        # Move o arquivo temporário para o destino final
+        shutil.move(temp_path, str(dest))
+        
+        logger.info(f"Usuário {user.id}: Arquivo salvo com sucesso - {fname}")
+
+        # Atualiza a mensagem
+        await query.edit_message_text(
+            f"*Arquivo salvo com sucesso.*\n\n"
+            f"Nome: `{fname}`\n"
+            f"Local: `{DOWNLOAD_DIR}/`",
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        logger.error(f"Usuário {user.id}: Falha ao salvar arquivo - {e}", exc_info=True)
+        await query.edit_message_text(
+            f"*Falha ao salvar:*\n\n`{e}`\n\n"
+            "Por favor, tente novamente.",
+            parse_mode="Markdown"
+        )
+        # Remove arquivo temporário em caso de erro
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return WAITING_PHOTO
+
+    # Limpa dados do contexto
+    context.user_data.clear()
+
+    # Manda uma mensagem preparando para a próxima
     if query.message and query.message.chat:
-        try:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text="Se quiser salvar outra guia, é só *enviar outra foto* com nome e data na legenda. Para sair, use /cancel.",
-                parse_mode="Markdown",
-            )
-        except BadRequest:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text="Se quiser salvar outra guia, é só enviar outra foto com nome e data na legenda. Para sair, use /cancel."
-            )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Para salvar outra guia, envie uma nova foto.\n"
+                 "Use /cancel para encerrar.",
+            parse_mode="Markdown",
+        )
 
     return WAITING_PHOTO
 
 async def handle_text_when_waiting_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info(f"Texto recebido quando esperava foto: {update.message.text}")
-    try:
-        await update.message.reply_text(
-            "Envie uma *foto* com nome e data na legenda para começar. 😊\n\n"
-            "📝 *Formato:* `João Silva 15/10/2025`", 
-            parse_mode="Markdown"
-        )
-    except BadRequest:
-        await update.message.reply_text(
-            "Envie uma foto com nome e data na legenda para começar. 😊\n\n"
-            "�� Formato: João Silva 15/10/2025"
-        )
+    """Handler para mensagens de texto quando esperando foto."""
+    await update.message.reply_text(
+        "Envie uma *foto* da guia para continuar.\n"
+        "Use /cancel para encerrar.",
+        parse_mode="Markdown"
+    )
     return WAITING_PHOTO
 
-async def post_init(application: Application) -> None:
-    """Envia uma mensagem quando o bot estiver pronto."""
-    logger.info("Bot inicializado, tentando enviar mensagem de confirmação...")
-    
-    # Obtém informações do bot e imprime
-    try:
-        bot_info = await application.bot.get_me()
-        bot_name = bot_info.first_name
-        token = os.getenv("BOT_TOKEN", "N/A")
-        
-        print("\n" + "="*50)
-        print("🤖 BOT INICIADO")
-        print("="*50)
-        print(f"Token: {token}")
-        print(f"Nome do Bot: {bot_name}")
-        print("="*50 + "\n")
-    except Exception as e:
-        logger.error(f"Erro ao obter informações do bot: {e}")
-        token = os.getenv("BOT_TOKEN", "N/A")
-        print("\n" + "="*50)
-        print("🤖 BOT INICIADO")
-        print("="*50)
-        print(f"Token: {token}")
-        print("Nome do Bot: Erro ao obter informações")
-        print("="*50 + "\n")
-    
-    chat_id = os.getenv("ADMIN_CHAT_ID")
-    if chat_id:
-        try:
-            await application.bot.send_message(
-                chat_id=int(chat_id),
-                text="🤖 Bot iniciado e pronto para receber guias! Use /start para começar.",
-                parse_mode="Markdown",
-            )
-            logger.info(f"Mensagem de inicialização enviada para o chat {chat_id}")
-        except Exception as e:
-            logger.error(f"Não foi possível enviar mensagem de inicialização: {e}")
-    else:
-        logger.warning("ADMIN_CHAT_ID não configurado. Bot iniciado sem enviar mensagem.")
-
 def main():
+    """Função principal que inicializa e roda o bot."""
+    logger.info("=" * 50)
+    logger.info("Iniciando bot de processamento de guias odontológicas")
+    logger.info("=" * 50)
+    
+    # Valida token
     token = os.getenv("BOT_TOKEN")
     if not token:
-        logger.error("BOT_TOKEN não encontrado!")
+        logger.critical("BOT_TOKEN não definido no arquivo .env")
         raise RuntimeError("Defina a variável de ambiente BOT_TOKEN com o token do BotFather.")
 
-    logger.info("Iniciando aplicação...")
-    
-    application = Application.builder().token(token).post_init(post_init).build()
+    # Cria aplicação
+    application = Application.builder().token(token).build()
 
+    # Configura ConversationHandler
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -403,8 +570,8 @@ def main():
                 MessageHandler(filters.PHOTO, handle_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_when_waiting_photo),
             ],
-            WAITING_DOC_TYPE: [
-                CallbackQueryHandler(handle_doc_type),
+            WAITING_CONFIRMATION: [
+                CallbackQueryHandler(handle_confirmation),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -413,23 +580,24 @@ def main():
     )
 
     application.add_handler(conv)
-    
-    # Adiciona handler para /stop (fora do ConversationHandler para estar sempre disponível)
-    application.add_handler(CommandHandler("stop", stop))
 
-    logger.info("Bot configurado, iniciando polling...")
-    print("Bot rodando... Pressione Ctrl+C para parar.")
+    logger.info("Bot configurado com sucesso")
+    logger.info(f"Diretório de salvamento: {DOWNLOAD_DIR.absolute()}")
+    print("\n" + "="*50)
+    print("BOT RODANDO - Pressione Ctrl+C para parar")
+    print("="*50 + "\n")
     
-    try:
-        # MUDANÇA PRINCIPAL: usar run_polling() diretamente em vez de asyncio.run()
-        application.run_polling(drop_pending_updates=True)
-    except KeyboardInterrupt:
-        logger.info("Bot encerrado pelo usuário.")
-        print("\nBot encerrado pelo usuário.")
-    except Exception as e:
-        logger.error(f"Erro ao rodar o bot: {e}")
-        print(f"Erro ao rodar o bot: {e}")
-        raise
+    application.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot encerrado pelo usuário")
+        print("\n\nBot encerrado.")
+    except RuntimeError:
+        # Fallback para ambientes que já têm event loop
+        main()
+    except Exception as e:
+        logger.critical(f"Erro fatal ao iniciar bot: {e}", exc_info=True)
+        raise
